@@ -1,9 +1,15 @@
-"""TORAX interface for the EPEDNN-mit pedestal model.
+"""TORAX interface for the EPEDNN-mit pedestal models.
 
-Please cite [M. Muraca et al. 2025 Nucl. Fusion 65
-096010](https://doi.org/10.1088/1741-4326/adf656) in any works using this model.
-Currently, this model is only valid for the SPARC parameter space, as specified
-in https://github.com/aaronkho/epednn_mit/tree/main/src/epednn_mit/models/sparc.
+Two machines are supported, selected via the ``machine`` config field:
+
+- ``"sparc"``: valid for the SPARC parameter space, as specified in
+  https://github.com/aaronkho/epednn_mit/tree/main/src/epednn_mit/models/sparc.
+  Please cite [M. Muraca et al. 2025 Nucl. Fusion 65
+  096010](https://doi.org/10.1088/1741-4326/adf656) in any works using it.
+- ``"scoping"``: trained for high-field FPP scoping studies on dimensionless
+  inputs, as specified in
+  https://github.com/aaronkho/epednn_mit/tree/scoping_model/src/epednn_mit/models/scoping.
+  A citation for this model is pending.
 
 This file defines the four necessary classes to use the model in TORAX:
 1. A wrapper class, which closes over the EPEDNN-mit model, parameters, and
@@ -23,7 +29,8 @@ import pathlib
 from typing import Annotated, Any, Final, Literal, TypeAlias
 
 import chex
-from epednn_mit.models.sparc import jax_model as epednn_mit_jax_model
+from epednn_mit.models.scoping import jax_model as epednn_mit_scoping_jax_model
+from epednn_mit.models.sparc import jax_model as epednn_mit_sparc_jax_model
 import jax
 from jax import numpy as jnp
 import jaxtyping as jt
@@ -41,7 +48,7 @@ from typing_extensions import override
 
 EPEDNNmitStats: TypeAlias = dict[str, jax.Array]
 EPEDNNmitParams: TypeAlias = dict[str, Any]
-EPEDNNmitMachine: TypeAlias = Literal["sparc"]
+EPEDNNmitMachine: TypeAlias = Literal["sparc", "scoping"]
 
 # For definitions of these parameters, see the EPEDNN-mit SPARC README:
 # https://github.com/aaronkho/epednn_mit/blob/main/src/epednn_mit/models/sparc/README.txt
@@ -59,6 +66,30 @@ _SPARC_INPUT_BOUNDS: Final[dict[str, tuple[float, float]]] = {
 _SPARC_DEVICE_MAJOR_RADIUS: Final[float] = 1.85
 _SPARC_DEVICE_MINOR_RADIUS: Final[float] = 0.57
 
+# For definitions of these parameters, see the EPEDNN-mit scoping README:
+# https://github.com/aaronkho/epednn_mit/blob/scoping_model/src/epednn_mit/models/scoping/README.txt
+_SCOPING_INPUT_BOUNDS: Final[dict[str, tuple[float, float]]] = {
+    "a": (0.4, 2.2),
+    "aspect": (2.0, 4.2),
+    "kappa": (1.3, 2.5),
+    "delta": (0.3, 0.7),
+    # README: "not a clean boundary so (3.0, 17.0) might be more prudent".
+    "bt": (2.0, 18.0),
+    "qstar": (3.0, 5.0),
+    "betan": (0.3, 3.7),
+    "zeff": (1.2, 3.2),
+    "fgped": (0.3, 1.3),
+    "nsfrac": (0.2, 0.8),
+    "tesep": (50.0, 500.0),  # [eV]
+}
+
+# psi_N surface where the scoping shape parameters (kappa, delta) are sampled.
+# EPED internals do not model X-points, so LCFS shaping values that include
+# them can throw off the prediction; psi_N = 0.995 is the recommended
+# approximation when coupling to a core transport model (used by MAESTRO;
+# A. Ho, private communication, July 2026).
+_SCOPING_SHAPE_PSI_NORM: Final[float] = 0.995
+
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
@@ -68,6 +99,9 @@ class RuntimeParams(torax.pedestal.RuntimeParams):
   n_e_ped: jt.Float[jt.Scalar, ""]  # [m^-3]
   T_i_T_e_ratio: jt.Float[jt.Scalar, ""]
   P_ped_multiplier: jt.Float[jt.Scalar, ""]
+  # Scoping-model inputs not derivable from TORAX state (unused by "sparc").
+  nsfrac: jt.Float[jt.Scalar, ""]  # n_e_sep / n_e_ped
+  tesep: jt.Float[jt.Scalar, ""]  # [eV]
 
 
 class EPEDNNmitPedestalModelWrapper:
@@ -80,27 +114,38 @@ class EPEDNNmitPedestalModelWrapper:
   def __init__(self, machine: EPEDNNmitMachine):
     self.machine = machine
 
-    # Freeze in parameters of the model specific to the machine.
+    # Freeze in parameters of the model specific to the machine. The sparc and
+    # scoping jax modules share an API but differ in architecture and pickle
+    # key map, so each machine loads through its own module.
     match self.machine:
       case "sparc":
-        model_dir = pathlib.Path(epednn_mit_jax_model.__file__).parent
-        model_weights = sorted(model_dir.glob("epednn_mit_sparc_*.pkl"))
-        self._stats, self._params = (
-            epednn_mit_jax_model.load_ensemble_params_from_pickle(model_weights)
-        )
-        self.model = epednn_mit_jax_model.EPEDNNmitEnsemble()
-        self.input_lower_bounds = jnp.array(
-            [_SPARC_INPUT_BOUNDS[key][0] for key in _SPARC_INPUT_BOUNDS]
-        )
-        self.input_upper_bounds = jnp.array(
-            [_SPARC_INPUT_BOUNDS[key][1] for key in _SPARC_INPUT_BOUNDS]
-        )
+        jax_model = epednn_mit_sparc_jax_model
+        weights_glob = "epednn_mit_sparc_*.pkl"
+        input_bounds = _SPARC_INPUT_BOUNDS
         self.R_0 = _SPARC_DEVICE_MAJOR_RADIUS
         self.a_0 = _SPARC_DEVICE_MINOR_RADIUS
+      case "scoping":
+        jax_model = epednn_mit_scoping_jax_model
+        weights_glob = "epednn_mit_scoping_*.pkl"
+        input_bounds = _SCOPING_INPUT_BOUNDS
       case _:
         raise ValueError(
-            f"Unsupported machine: {machine}. Only SPARC is supported."
+            f"Unsupported machine: {machine}. "
+            "Only 'sparc' and 'scoping' are supported."
         )
+
+    model_dir = pathlib.Path(jax_model.__file__).parent
+    model_weights = sorted(model_dir.glob(weights_glob))
+    self._stats, self._params = jax_model.load_ensemble_params_from_pickle(
+        model_weights
+    )
+    self.model = jax_model.EPEDNNmitEnsemble()
+    self.input_lower_bounds = jnp.array(
+        [bounds[0] for bounds in input_bounds.values()]
+    )
+    self.input_upper_bounds = jnp.array(
+        [bounds[1] for bounds in input_bounds.values()]
+    )
 
   def __call__(self, inputs: jax.Array) -> tuple[jax.Array, jax.Array]:
     P_ped_kPa, pedestal_width_psi_norm = self.model.apply(
@@ -134,7 +179,7 @@ class EPEDNNmitPedestalModel(pedestal_model_lib.PedestalModel):
       geo: torax.Geometry,
       core_profiles: torax.CoreProfiles,
       previous_rho_norm_ped_top: jax.Array | None = None,
-  ) -> jt.Float[jt.Array, "9"]:
+  ) -> jt.Float[jt.Array, " n_inputs"]:
     """Prepares the inputs for EPEDNN-mit.
 
     When ``previous_rho_norm_ped_top`` is provided (and is not the
@@ -173,7 +218,8 @@ class EPEDNNmitPedestalModel(pedestal_model_lib.PedestalModel):
         top. ``jnp.inf`` signals first timestep (placeholder).
 
     Returns:
-      9-element float32 array of clipped EPED-NN inputs.
+      Float32 array of clipped EPED-NN inputs (9 for "sparc", 11 for
+      "scoping").
     """
     assert isinstance(runtime_params.pedestal, RuntimeParams)
 
@@ -218,21 +264,70 @@ class EPEDNNmitPedestalModel(pedestal_model_lib.PedestalModel):
     ped_idx = jnp.argmin(jnp.abs(geo.rho_norm - rho_ped))
     Z_eff_ped = core_profiles.Z_eff[ped_idx]
 
-    raw_inputs = jnp.array(
-        [
-            core_profiles.Ip_profile_face[-1] * 1e-6,  # [MA]
-            geo.B_0,  # [T]
-            self.model.R_0,  # [m]
-            self.model.a_0,  # [m]
-            geo.elongation_face[-1],  # []
-            geo.delta_face[-1],  # []
-            n_e_ped * 1e-19,  # [10^19 m^-3]
-            beta_N,  # [%]
-            Z_eff_ped,  # []
-        ],
-        # Network was trained with float32
-        dtype=jnp.float32,
-    )
+    Ip_MA = core_profiles.Ip_profile_face[-1] * 1e-6
+
+    if self.machine == "scoping":
+      # Shape parameters at psi_N = _SCOPING_SHAPE_PSI_NORM on the face grid.
+      psi_norm_face = (psi_face - psi_face[0]) / (psi_face[-1] - psi_face[0])
+      kappa = jnp.interp(
+          _SCOPING_SHAPE_PSI_NORM, psi_norm_face, geo.elongation_face
+      )
+      delta = jnp.interp(
+          _SCOPING_SHAPE_PSI_NORM, psi_norm_face, geo.delta_face
+      )
+      a_minor = geo.a_minor
+      eps = a_minor / geo.R_major
+
+      # ITER-89P cylindrical-equivalent q* (Uckan, ITER Physics Design
+      # Guidelines 1989), the definition used to build the training set;
+      # kappa/delta are the same values passed to the network
+      # (A. Ho, private communication, July 2026).
+      shape_factor = (
+          0.5
+          * (1.0 + kappa**2 * (1.0 + 2.0 * delta**2 - 1.2 * delta**3))
+          * (1.17 - 0.65 * eps)
+          / (1.0 - eps**2) ** 2
+      )
+      qstar = shape_factor * 5.0 * a_minor**2 * geo.B_0 / (geo.R_major * Ip_MA)
+
+      # Greenwald fraction with the standard Ip/(pi a^2) factor, using the
+      # pedestal n_e (same definition as the sparc neped input) rather than
+      # the customary line/volume average.
+      fgped = formulas.calculate_greenwald_fraction(n_e_ped, core_profiles, geo)
+
+      raw_inputs = jnp.array(
+          [
+              a_minor,  # [m]
+              geo.R_major / a_minor,  # aspect ratio []
+              kappa,  # []
+              delta,  # []
+              geo.B_0,  # [T]
+              qstar,  # []
+              beta_N,  # [%]
+              Z_eff_ped,  # []
+              fgped,  # []
+              runtime_params.pedestal.nsfrac,  # []
+              runtime_params.pedestal.tesep,  # [eV]
+          ],
+          # Network was trained with float32
+          dtype=jnp.float32,
+      )
+    else:
+      raw_inputs = jnp.array(
+          [
+              Ip_MA,  # [MA]
+              geo.B_0,  # [T]
+              self.model.R_0,  # [m]
+              self.model.a_0,  # [m]
+              geo.elongation_face[-1],  # []
+              geo.delta_face[-1],  # []
+              n_e_ped * 1e-19,  # [10^19 m^-3]
+              beta_N,  # [%]
+              Z_eff_ped,  # []
+          ],
+          # Network was trained with float32
+          dtype=jnp.float32,
+      )
 
     clipped_inputs = jnp.clip(
         raw_inputs,
@@ -349,16 +444,22 @@ class EPEDNNmitConfig(torax.pedestal.BasePedestal):
   """TORAX pedestal model config using EPEDNN-mit.
 
   Attributes:
+    machine: Which EPEDNN-mit network to use ("sparc" or "scoping").
     n_e_ped: The electron density at the pedestal top [m^-3].
     T_i_T_e_ratio: Ratio of the ion and electron temperature at the pedestal
       [dimensionless].
     P_ped_multiplier: Multiplier for the pedestal pressure (mostly used for
       sensitivity analysis) [dimensionless].
+    nsfrac: Separatrix-to-pedestal electron density ratio n_e_sep / n_e_ped
+      [dimensionless]. Scoping-model input; unused by "sparc".
+    tesep: Separatrix electron temperature [eV]. Scoping-model input; unused
+      by "sparc".
   """
 
   model_name: Annotated[Literal["epednn_mit"], torax_pydantic.JAX_STATIC] = (
       "epednn_mit"
   )
+  machine: Annotated[EPEDNNmitMachine, torax_pydantic.JAX_STATIC] = "sparc"
   n_e_ped: torax_pydantic.TimeVaryingScalar = torax_pydantic.ValidatedDefault(
       0.7e20
   )
@@ -368,34 +469,36 @@ class EPEDNNmitConfig(torax.pedestal.BasePedestal):
   P_ped_multiplier: torax_pydantic.TimeVaryingScalar = (
       torax_pydantic.ValidatedDefault(1.0)
   )
+  nsfrac: torax_pydantic.TimeVaryingScalar = torax_pydantic.ValidatedDefault(
+      0.4
+  )
+  tesep: torax_pydantic.TimeVaryingScalar = torax_pydantic.ValidatedDefault(
+      75.0
+  )
 
   def build_pedestal_model(
       self,
   ) -> EPEDNNmitPedestalModel:
     return EPEDNNmitPedestalModel(
+        machine=self.machine,
         formation_model=self.formation_model.build_formation_model(),
         saturation_model=self.saturation_model.build_saturation_model(),
     )
 
   def build_runtime_params(self, t: chex.Numeric) -> RuntimeParams:
     base_runtime_params = super().build_runtime_params(t)
+    # Rebuild the base fields generically so this survives base-class field
+    # additions and renames across TORAX versions (e.g. the
+    # use_formation_model_* rename between 1.4.2 and head).
+    base_fields = {
+        field.name: getattr(base_runtime_params, field.name)
+        for field in dataclasses.fields(type(base_runtime_params))
+    }
     return RuntimeParams(
-        set_pedestal=base_runtime_params.set_pedestal,
-        mode=base_runtime_params.mode,
-        use_formation_model_with_internal_boundary_condition=base_runtime_params.use_formation_model_with_internal_boundary_condition,
-        transition_time_width=base_runtime_params.transition_time_width,
-        P_LH_hysteresis_factor=base_runtime_params.P_LH_hysteresis_factor,
-        include_dW_dt_in_P_SOL=base_runtime_params.include_dW_dt_in_P_SOL,
-        explicit_pedestal=base_runtime_params.explicit_pedestal,
-        pedestal_profile_form=base_runtime_params.pedestal_profile_form,
-        formation=base_runtime_params.formation,
-        saturation=base_runtime_params.saturation,
-        chi_max=base_runtime_params.chi_max,
-        D_e_max=base_runtime_params.D_e_max,
-        V_e_max=base_runtime_params.V_e_max,
-        V_e_min=base_runtime_params.V_e_min,
-        pedestal_top_smoothing_width=base_runtime_params.pedestal_top_smoothing_width,
+        **base_fields,
         P_ped_multiplier=self.P_ped_multiplier.get_value(t),
         n_e_ped=self.n_e_ped.get_value(t),
         T_i_T_e_ratio=self.T_i_T_e_ratio.get_value(t),
+        nsfrac=self.nsfrac.get_value(t),
+        tesep=self.tesep.get_value(t),
     )
