@@ -12,10 +12,13 @@ Two machines are supported, selected via the ``machine`` config field:
   A citation for this model is pending.
 
 This file defines the four necessary classes to use the model in TORAX:
-1. A wrapper class, which closes over the EPEDNN-mit model, parameters, and
-   statistics. This is necessary to make the model hashable.
-2. A TORAX pedestal model, which calls the wrapper within its
-   _call_implementation. This is what will be called by TORAX.
+1. A network wrapper, which closes over the EPEDNN-mit model, parameters, and
+   statistics. This is necessary to make the model hashable. Each network is a
+   subclass of ``BaseEPEDNNmitModel`` declaring its weights and its named
+   inputs; everything else -- loading, input packing, clipping -- is shared.
+2. A TORAX pedestal model, which derives the network-independent quantities
+   from TORAX state and calls the wrapper within its _call_implementation.
+   This is what will be called by TORAX.
 3. A TORAX pedestal model Pydantic config, which is used to build the pedestal
    model and runtime params. This allows us to use the model from a TORAX
    config.
@@ -26,7 +29,8 @@ This file defines the four necessary classes to use the model in TORAX:
 
 import dataclasses
 import pathlib
-from typing import Annotated, Any, Final, Literal, TypeAlias
+import types
+from typing import Annotated, Any, ClassVar, Final, Literal, TypeAlias
 
 import chex
 from epednn_mit.models.scoping import jax_model as epednn_mit_scoping_jax_model
@@ -50,37 +54,49 @@ EPEDNNmitStats: TypeAlias = dict[str, jax.Array]
 EPEDNNmitParams: TypeAlias = dict[str, Any]
 EPEDNNmitMachine: TypeAlias = Literal["sparc", "scoping"]
 
+# Each network's inputs, in the order the network expects them: the network's
+# own input name (per its README) mapped to the quantity it is drawn from and
+# its training range. Iterating one dict drives both the input vector and its
+# clip bounds, so the two cannot fall out of order.
+#
+# Source keys refer either to `_derive_torax_quantities` output or to a
+# network's own `constants`. Names are qualified where the two networks draw
+# the same physical quantity from different places -- `kappa`/`delta` at the
+# LCFS for sparc versus psi_N = 0.995 for scoping, and a frozen device minor
+# radius for sparc versus the geometry's for scoping.
+InputSpecs: TypeAlias = dict[str, tuple[str, float, float]]
+
 # For definitions of these parameters, see the EPEDNN-mit SPARC README:
 # https://github.com/aaronkho/epednn_mit/blob/main/src/epednn_mit/models/sparc/README.txt
-_SPARC_INPUT_BOUNDS: Final[dict[str, tuple[float, float]]] = {
-    "Ip": (1.6, 14.3),
-    "Bt": (7.2, 12.2),
-    "R": (1.85, 1.85),
-    "a": (0.57, 0.57),
-    "kappa": (1.53, 2.29),
-    "delta": (0.39, 0.59),
-    "neped": (2.84, 90.235),
-    "betan": (0.8, 1.6),
-    "zeff": (1.3, 2.5),
+_SPARC_INPUT_SPECS: Final[InputSpecs] = {
+    "Ip": ("Ip_MA", 1.6, 14.3),
+    "Bt": ("B_0", 7.2, 12.2),
+    "R": ("R_device", 1.85, 1.85),
+    "a": ("a_device", 0.57, 0.57),
+    "kappa": ("kappa_lcfs", 1.53, 2.29),
+    "delta": ("delta_lcfs", 0.39, 0.59),
+    "neped": ("n_e_ped_1e19", 2.84, 90.235),
+    "betan": ("beta_N", 0.8, 1.6),
+    "zeff": ("Z_eff_ped", 1.3, 2.5),
 }
 _SPARC_DEVICE_MAJOR_RADIUS: Final[float] = 1.85
 _SPARC_DEVICE_MINOR_RADIUS: Final[float] = 0.57
 
 # For definitions of these parameters, see the EPEDNN-mit scoping README:
 # https://github.com/aaronkho/epednn_mit/blob/scoping_model/src/epednn_mit/models/scoping/README.txt
-_SCOPING_INPUT_BOUNDS: Final[dict[str, tuple[float, float]]] = {
-    "a": (0.4, 2.2),
-    "aspect": (2.0, 4.2),
-    "kappa": (1.3, 2.5),
-    "delta": (0.3, 0.7),
+_SCOPING_INPUT_SPECS: Final[InputSpecs] = {
+    "a": ("a_minor", 0.4, 2.2),
+    "aspect": ("aspect", 2.0, 4.2),
+    "kappa": ("kappa_995", 1.3, 2.5),
+    "delta": ("delta_995", 0.3, 0.7),
     # README: "not a clean boundary so (3.0, 17.0) might be more prudent".
-    "bt": (2.0, 18.0),
-    "qstar": (3.0, 5.0),
-    "betan": (0.3, 3.7),
-    "zeff": (1.2, 3.2),
-    "fgped": (0.3, 1.3),
-    "nsfrac": (0.2, 0.8),
-    "tesep": (50.0, 500.0),  # [eV]
+    "bt": ("B_0", 2.0, 18.0),
+    "qstar": ("qstar", 3.0, 5.0),
+    "betan": ("beta_N", 0.3, 3.7),
+    "zeff": ("Z_eff_ped", 1.2, 3.2),
+    "fgped": ("fgped", 0.3, 1.3),
+    "nsfrac": ("nsfrac", 0.2, 0.8),
+    "tesep": ("tesep", 50.0, 500.0),  # [eV]
 }
 
 # psi_N surface where the scoping shape parameters (kappa, delta) are sampled.
@@ -104,48 +120,81 @@ class RuntimeParams(torax.pedestal.RuntimeParams):
   tesep: jt.Float[jt.Scalar, ""]  # [eV]
 
 
-class EPEDNNmitPedestalModelWrapper:
-  """Wrapper for the EPEDNN-mit pedestal model.
+class BaseEPEDNNmitModel:
+  """One EPEDNN-mit network, with its weights and named inputs.
 
   Captures the EPEDNN-mit model, parameters, and statistics as attributes of
   the class. Hashes by value (machine name), not id.
+
+  Everything that runs -- weight loading, input selection, clipping,
+  inference -- is shared. Only data differs between networks, so a subclass
+  is a declaration: set ``machine``, ``jax_model``, ``weights_glob``,
+  ``input_specs``, and ``constants`` if the network takes any fixed inputs.
   """
 
-  def __init__(self, machine: EPEDNNmitMachine):
-    self.machine = machine
+  machine: ClassVar[EPEDNNmitMachine]
+  # The sparc and scoping jax modules share an API but differ in architecture
+  # and pickle key map, so each network loads through its own module.
+  jax_model: ClassVar[types.ModuleType]
+  weights_glob: ClassVar[str]
+  # The network's inputs, in the order the network expects them.
+  input_specs: ClassVar[InputSpecs]
+  # Network inputs that are fixed rather than derived from TORAX state.
+  constants: ClassVar[dict[str, float]] = {}
 
-    # Freeze in parameters of the model specific to the machine. The sparc and
-    # scoping jax modules share an API but differ in architecture and pickle
-    # key map, so each machine loads through its own module.
-    match self.machine:
-      case "sparc":
-        jax_model = epednn_mit_sparc_jax_model
-        weights_glob = "epednn_mit_sparc_*.pkl"
-        input_bounds = _SPARC_INPUT_BOUNDS
-        self.R_0 = _SPARC_DEVICE_MAJOR_RADIUS
-        self.a_0 = _SPARC_DEVICE_MINOR_RADIUS
-      case "scoping":
-        jax_model = epednn_mit_scoping_jax_model
-        weights_glob = "epednn_mit_scoping_*.pkl"
-        input_bounds = _SCOPING_INPUT_BOUNDS
-      case _:
-        raise ValueError(
-            f"Unsupported machine: {machine}. "
-            "Only 'sparc' and 'scoping' are supported."
-        )
+  def __init__(self):
+    model_dir = pathlib.Path(self.jax_model.__file__).parent
+    model_weights = sorted(model_dir.glob(self.weights_glob))
+    self._stats, self._params = (
+        self.jax_model.load_ensemble_params_from_pickle(model_weights)
+    )
+    self.model = self.jax_model.EPEDNNmitEnsemble()
 
-    model_dir = pathlib.Path(jax_model.__file__).parent
-    model_weights = sorted(model_dir.glob(weights_glob))
-    self._stats, self._params = jax_model.load_ensemble_params_from_pickle(
-        model_weights
+  @property
+  def input_lower_bounds(self) -> jax.Array:
+    return jnp.array([lo for _, lo, _ in self.input_specs.values()])
+
+  @property
+  def input_upper_bounds(self) -> jax.Array:
+    return jnp.array([hi for _, _, hi in self.input_specs.values()])
+
+  def pack_inputs(self, quantities: dict[str, Any]) -> jax.Array:
+    """Selects, orders and clips this network's inputs.
+
+    One pass over ``input_specs`` drives the value lookup and both clip
+    bounds, so an input can never be clipped against another's range.
+
+    Args:
+      quantities: Named quantities derived from TORAX state, as returned by
+        ``EPEDNNmitPedestalModel._derive_torax_quantities``.
+    """
+    available = quantities | self.constants
+    raw_inputs = jnp.array(
+        # Networks were trained with float32. The clip promotes back to the
+        # bounds' dtype, which is what the network must see: evaluated at a
+        # precision its loaded weights and normalisation statistics are not
+        # in, it returns a value ~4e6 too large instead of failing.
+        [available[source] for source, _, _ in self.input_specs.values()],
+        dtype=jnp.float32,
     )
-    self.model = jax_model.EPEDNNmitEnsemble()
-    self.input_lower_bounds = jnp.array(
-        [bounds[0] for bounds in input_bounds.values()]
+    return jnp.clip(
+        raw_inputs, self.input_lower_bounds, self.input_upper_bounds
     )
-    self.input_upper_bounds = jnp.array(
-        [bounds[1] for bounds in input_bounds.values()]
-    )
+
+  def out_of_range_inputs(
+      self, quantities: dict[str, Any]
+  ) -> dict[str, tuple[float, float, float]]:
+    """Maps each input outside its training range to ``(value, min, max)``.
+
+    ``pack_inputs`` clips silently, so a prediction can look reasonable while
+    resting on a clipped input. For diagnostics, off the traced path.
+    """
+    available = quantities | self.constants
+    return {
+        name: (float(available[source]), lo, hi)
+        for name, (source, lo, hi) in self.input_specs.items()
+        if not lo <= float(available[source]) <= hi
+    }
 
   def __call__(self, inputs: jax.Array) -> tuple[jax.Array, jax.Array]:
     P_ped_kPa, pedestal_width_psi_norm = self.model.apply(
@@ -157,30 +206,70 @@ class EPEDNNmitPedestalModelWrapper:
     return hash(self.machine)
 
 
+class SparcModel(BaseEPEDNNmitModel):
+  """EPEDNN-mit trained on the SPARC parameter space."""
+
+  machine = "sparc"
+  jax_model = epednn_mit_sparc_jax_model
+  weights_glob = "epednn_mit_sparc_*.pkl"
+  input_specs = _SPARC_INPUT_SPECS
+  # SPARC's geometry is baked into the training set, so the network takes the
+  # device major and minor radius as fixed inputs.
+  constants = {
+      "R_device": _SPARC_DEVICE_MAJOR_RADIUS,
+      "a_device": _SPARC_DEVICE_MINOR_RADIUS,
+  }
+
+
+class ScopingModel(BaseEPEDNNmitModel):
+  """EPEDNN-mit trained on dimensionless high-field FPP scoping inputs.
+
+  Every input is drawn from TORAX state or config, so there are no fixed
+  device constants.
+  """
+
+  machine = "scoping"
+  jax_model = epednn_mit_scoping_jax_model
+  weights_glob = "epednn_mit_scoping_*.pkl"
+  input_specs = _SCOPING_INPUT_SPECS
+
+
+MODELS: Final[dict[str, type[BaseEPEDNNmitModel]]] = {
+    model.machine: model for model in (SparcModel, ScopingModel)
+}
+
+
 @dataclasses.dataclass(frozen=True, eq=False)
 class EPEDNNmitPedestalModel(pedestal_model_lib.PedestalModel):
   """TORAX pedestal model using EPEDNN-mit to predict pressure and width."""
 
   machine: EPEDNNmitMachine = "sparc"
   # The following fields are set by __post_init__.
-  model: EPEDNNmitPedestalModelWrapper = dataclasses.field(init=False)
+  model: BaseEPEDNNmitModel = dataclasses.field(init=False)
 
   def __post_init__(self):
+    if self.machine not in MODELS:
+      raise ValueError(
+          f"Unsupported machine: {self.machine}. Supported machines are "
+          f"{sorted(MODELS)}."
+      )
     # Need to use __setattr__  to install attributes as this is a frozen
     # dataclass.
-    object.__setattr__(
-        self, "model", EPEDNNmitPedestalModelWrapper(self.machine)
-    )
+    object.__setattr__(self, "model", MODELS[self.machine]())
     super().__post_init__()
 
-  def _prepare_inputs(
+  def _derive_torax_quantities(
       self,
       runtime_params: torax.RuntimeParams,
       geo: torax.Geometry,
       core_profiles: torax.CoreProfiles,
       previous_rho_norm_ped_top: jax.Array | None = None,
-  ) -> jt.Float[jt.Array, " n_inputs"]:
-    """Prepares the inputs for EPEDNN-mit.
+  ) -> dict[str, Any]:
+    """Derives every quantity any EPEDNN-mit network takes as an input.
+
+    Network-independent: the selected network picks what it needs by name in
+    ``BaseEPEDNNmitModel.pack_inputs``. Quantities no network reads are
+    dropped by XLA, so deriving all of them costs nothing.
 
     When ``previous_rho_norm_ped_top`` is provided (and is not the
     placeholder ``inf``), Z_eff and n_e_ped are evaluated at the mtanh
@@ -218,8 +307,8 @@ class EPEDNNmitPedestalModel(pedestal_model_lib.PedestalModel):
         top. ``jnp.inf`` signals first timestep (placeholder).
 
     Returns:
-      Float32 array of clipped EPED-NN inputs (9 for "sparc", 11 for
-      "scoping").
+      Named quantities, keyed by the source names in the networks'
+      ``input_specs``.
     """
     assert isinstance(runtime_params.pedestal, RuntimeParams)
 
@@ -266,76 +355,65 @@ class EPEDNNmitPedestalModel(pedestal_model_lib.PedestalModel):
 
     Ip_MA = core_profiles.Ip_profile_face[-1] * 1e-6
 
-    if self.machine == "scoping":
-      # Shape parameters at psi_N = _SCOPING_SHAPE_PSI_NORM on the face grid.
-      psi_norm_face = (psi_face - psi_face[0]) / (psi_face[-1] - psi_face[0])
-      kappa = jnp.interp(
-          _SCOPING_SHAPE_PSI_NORM, psi_norm_face, geo.elongation_face
-      )
-      delta = jnp.interp(
-          _SCOPING_SHAPE_PSI_NORM, psi_norm_face, geo.delta_face
-      )
-      a_minor = geo.a_minor
-      eps = a_minor / geo.R_major
-
-      # ITER-89P cylindrical-equivalent q* (Uckan, ITER Physics Design
-      # Guidelines 1989), the definition used to build the training set;
-      # kappa/delta are the same values passed to the network
-      # (A. Ho, private communication, July 2026).
-      shape_factor = (
-          0.5
-          * (1.0 + kappa**2 * (1.0 + 2.0 * delta**2 - 1.2 * delta**3))
-          * (1.17 - 0.65 * eps)
-          / (1.0 - eps**2) ** 2
-      )
-      qstar = shape_factor * 5.0 * a_minor**2 * geo.B_0 / (geo.R_major * Ip_MA)
-
-      # Greenwald fraction with the standard Ip/(pi a^2) factor, using the
-      # pedestal n_e (same definition as the sparc neped input) rather than
-      # the customary line/volume average.
-      fgped = formulas.calculate_greenwald_fraction(n_e_ped, core_profiles, geo)
-
-      raw_inputs = jnp.array(
-          [
-              a_minor,  # [m]
-              geo.R_major / a_minor,  # aspect ratio []
-              kappa,  # []
-              delta,  # []
-              geo.B_0,  # [T]
-              qstar,  # []
-              beta_N,  # [%]
-              Z_eff_ped,  # []
-              fgped,  # []
-              runtime_params.pedestal.nsfrac,  # []
-              runtime_params.pedestal.tesep,  # [eV]
-          ],
-          # Network was trained with float32
-          dtype=jnp.float32,
-      )
-    else:
-      raw_inputs = jnp.array(
-          [
-              Ip_MA,  # [MA]
-              geo.B_0,  # [T]
-              self.model.R_0,  # [m]
-              self.model.a_0,  # [m]
-              geo.elongation_face[-1],  # []
-              geo.delta_face[-1],  # []
-              n_e_ped * 1e-19,  # [10^19 m^-3]
-              beta_N,  # [%]
-              Z_eff_ped,  # []
-          ],
-          # Network was trained with float32
-          dtype=jnp.float32,
-      )
-
-    clipped_inputs = jnp.clip(
-        raw_inputs,
-        self.model.input_lower_bounds,
-        self.model.input_upper_bounds,
+    # -- Shape parameters at psi_N = _SCOPING_SHAPE_PSI_NORM --
+    psi_norm_face = (psi_face - psi_face[0]) / (psi_face[-1] - psi_face[0])
+    kappa_995 = jnp.interp(
+        _SCOPING_SHAPE_PSI_NORM, psi_norm_face, geo.elongation_face
     )
+    delta_995 = jnp.interp(
+        _SCOPING_SHAPE_PSI_NORM, psi_norm_face, geo.delta_face
+    )
+    a_minor = geo.a_minor
+    eps = a_minor / geo.R_major
 
-    return clipped_inputs
+    # ITER-89P cylindrical-equivalent q* (Uckan, ITER Physics Design
+    # Guidelines 1989), the definition used to build the scoping training set;
+    # kappa/delta are the same values passed to the network
+    # (A. Ho, private communication, July 2026).
+    shape_factor = (
+        0.5
+        * (1.0 + kappa_995**2 * (1.0 + 2.0 * delta_995**2 - 1.2 * delta_995**3))
+        * (1.17 - 0.65 * eps)
+        / (1.0 - eps**2) ** 2
+    )
+    qstar = shape_factor * 5.0 * a_minor**2 * geo.B_0 / (geo.R_major * Ip_MA)
+
+    # Greenwald fraction with the standard Ip/(pi a^2) factor, using the
+    # pedestal n_e (same definition as the sparc neped input) rather than
+    # the customary line/volume average.
+    fgped = formulas.calculate_greenwald_fraction(n_e_ped, core_profiles, geo)
+
+    return {
+        "Ip_MA": Ip_MA,  # [MA]
+        "B_0": geo.B_0,  # [T]
+        "a_minor": a_minor,  # [m]
+        "aspect": geo.R_major / a_minor,  # []
+        "kappa_lcfs": geo.elongation_face[-1],  # []
+        "delta_lcfs": geo.delta_face[-1],  # []
+        "kappa_995": kappa_995,  # []
+        "delta_995": delta_995,  # []
+        "qstar": qstar,  # []
+        "beta_N": beta_N,  # [%]
+        "Z_eff_ped": Z_eff_ped,  # []
+        "n_e_ped_1e19": n_e_ped * 1e-19,  # [10^19 m^-3]
+        "fgped": fgped,  # []
+        "nsfrac": runtime_params.pedestal.nsfrac,  # []
+        "tesep": runtime_params.pedestal.tesep,  # [eV]
+    }
+
+  def _prepare_inputs(
+      self,
+      runtime_params: torax.RuntimeParams,
+      geo: torax.Geometry,
+      core_profiles: torax.CoreProfiles,
+      previous_rho_norm_ped_top: jax.Array | None = None,
+  ) -> jt.Float[jt.Array, " n_inputs"]:
+    """Returns this network's clipped input vector (9 sparc, 11 scoping)."""
+    return self.model.pack_inputs(
+        self._derive_torax_quantities(
+            runtime_params, geo, core_profiles, previous_rho_norm_ped_top
+        )
+    )
 
   @override
   def _call_implementation(
