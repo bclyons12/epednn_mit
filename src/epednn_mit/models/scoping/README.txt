@@ -16,7 +16,9 @@ fgped:  [  0.3  ,   1.3  ]
 nsfrac: [  0.2  ,   0.8  ]
 tesep:  [ 50.0  , 500.0  ]
 
-Both kappa and delta were taken from the normalized poloidal flux surface (psi) = 0.995 for the training dataset
+The training inputs were sampled randomly within these ranges, not taken from equilibria, so kappa and delta are not tied to a particular flux surface. EPED takes the shape at the LCFS but does not model X-points. Kappa and delta at normalized poloidal flux (psi) = 0.995 are recommended when coupling to a core transport model. The same kappa and delta enter qstar below.
+
+The outputs follow the location definitions of the SPARC network. The outputs are the pressure [kPa] at the pedestal top psi = 1 - 1.5*Delta and the pedestal-top width 1.5*Delta, where Delta is the mtanh width. The neped input is evaluated at the pedestal location psi = 1 - Delta.
 
 Derived quantities: several of the inputs are not raw simulation/equilibrium quantities but are derived from them. Using:
   a      = minor radius [m]

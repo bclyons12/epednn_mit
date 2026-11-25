@@ -13,7 +13,7 @@ import torax
 
 class EPEDNNmitPedestalModelTest(parameterized.TestCase):
 
-  def _build(self, machine: str):
+  def _build(self, machine: str, **overrides):
     # Register the EPEDNN-mit pedestal model with TORAX.
     torax.pedestal.register_pedestal_structure_model(
         epednn_mit_torax_interface.EPEDNNmitConfig
@@ -41,6 +41,8 @@ class EPEDNNmitPedestalModelTest(parameterized.TestCase):
             },
         },
     }
+    for section, values in overrides.items():
+      config[section] |= values
     torax_config = torax.ToraxConfig.from_dict(config)
     self.pedestal_model = torax_config.pedestal.build_pedestal_model()
     self.jitted_pedestal_model = jax.jit(self.pedestal_model)
@@ -256,6 +258,83 @@ class EPEDNNmitPedestalModelTest(parameterized.TestCase):
     np.testing.assert_allclose(inputs[6], expected_n_e_ped_1e19, rtol=1e-5)
     np.testing.assert_allclose(inputs[8], expected_z_eff_ped, rtol=1e-5)
 
+  def test_scoping_inputs(self):
+    """Tests the scoping inputs against the README derived-quantity formulas."""
+    # ARC-like plasma inside the scoping training ranges, except circular
+    # delta = 0, which is clipped to 0.3.
+    a, R, B_0, I_p = 1.2, 4.25, 11.5, 10e6
+    self._build(
+        'scoping',
+        profile_conditions={
+            'I_p': I_p,
+            'T_e_right_bc': 0.2,
+            'n_e': {0: {0: 2.0e20, 1: 1.5e20}},
+            'n_e_right_bc': 0.5e20,
+        },
+        plasma_composition={'Z_eff': 1.6},
+        geometry={
+            'R_major': R,
+            'a_minor': a,
+            'B_0': B_0,
+            'elongation_LCFS': 1.8,
+        },
+    )
+    structure_model = self.pedestal_model.structure_model
+    rho_norm_top = 0.88
+    inputs = structure_model._prepare_inputs(
+        self.runtime_params,
+        self.geo,
+        self.core_profiles,
+        previous_rho_norm_top=jax.numpy.asarray(rho_norm_top),
+    )
+
+    psi_norm_face = np.asarray(self.core_profiles.psi_norm_face)
+    rho_face_norm = np.asarray(self.geo.rho_face_norm)
+    psi_top = np.interp(rho_norm_top, rho_face_norm, psi_norm_face)
+    rho_ped = np.interp(
+        1.0 - (1.0 - psi_top) / 1.5, psi_norm_face, rho_face_norm
+    )
+    n_e_face = np.asarray(self.core_profiles.kinetic.n_e.face_value())
+    n_e_top = np.interp(rho_norm_top, rho_face_norm, n_e_face)
+    c_mtanh = 2.0 * np.tanh(1.0) / (np.tanh(1.0) + np.tanh(2.0))
+    n_e_ped = n_e_face[-1] + (n_e_top - n_e_face[-1]) * c_mtanh
+
+    # shape at psi_N = 0.995; circular elongation is linear in rho, so this
+    # differs from the LCFS value
+    kappa = np.interp(0.995, psi_norm_face, np.asarray(self.geo.elongation_face))
+    delta = np.interp(0.995, psi_norm_face, np.asarray(self.geo.delta_face))
+    self.assertLess(kappa, 1.8)
+    eps = a / R
+    shaping = (
+        0.5
+        * (1 + kappa**2 * (1 + 2 * delta**2 - 1.2 * delta**3))
+        * (1.17 - 0.65 * eps)
+        / (1 - eps**2) ** 2
+    )
+    expected = np.array([
+        a,
+        R / a,
+        kappa,
+        delta,
+        B_0,
+        5 * a**2 * B_0 * shaping / (R * I_p * 1e-6),
+        epednn_mit_torax_interface._calculate_beta_N(
+            self.core_profiles, self.geo
+        ),
+        np.interp(
+            rho_ped, rho_face_norm, np.asarray(self.core_profiles.ions.Z_eff_face)
+        ),
+        n_e_ped * 1e-20 / (I_p * 1e-6 / (np.pi * a**2)),  # fgped
+        n_e_face[-1] / n_e_ped,  # nsfrac
+        np.asarray(self.core_profiles.kinetic.T_e.face_value())[-1] * 1e3,
+    ])
+    lo, hi = np.array(
+        list(epednn_mit_torax_interface._SCOPING_INPUT_BOUNDS.values())
+    ).T
+
+    self.assertEqual(inputs.dtype, jax.numpy.float32)
+    np.testing.assert_allclose(inputs, np.clip(expected, lo, hi), rtol=1e-5)
+
   def test_pedestal_model_equality_and_wrapper_caching(self):
     """Tests equality, hashing, and wrapper caching across instantiations."""
     model_1 = epednn_mit_torax_interface.EPEDNNmitPedestalModel()
@@ -275,15 +354,14 @@ class EPEDNNmitPedestalModelTest(parameterized.TestCase):
     self.assertEqual(wrapper_1, wrapper_2)
     self.assertEqual(hash(wrapper_1), hash(wrapper_2))
 
-  def test_wrapper_float32_inference(self):
-    wrapper = epednn_mit_torax_interface.EPEDNNmitPedestalModelWrapper('sparc')
+  @parameterized.parameters(
+      ('sparc', epednn_mit_torax_interface._SPARC_INPUT_BOUNDS),
+      ('scoping', epednn_mit_torax_interface._SCOPING_INPUT_BOUNDS),
+  )
+  def test_wrapper_float32_inference(self, machine, bounds):
+    wrapper = epednn_mit_torax_interface.EPEDNNmitPedestalModelWrapper(machine)
     mid_f64 = jax.numpy.array(
-        [
-            0.5 * (lo + hi)
-            for lo, hi in (
-                epednn_mit_torax_interface._SPARC_INPUT_BOUNDS.values()
-            )
-        ],
+        [0.5 * (lo + hi) for lo, hi in bounds.values()],
         dtype=jax.numpy.float64,
     )
     mid_f32 = mid_f64.astype(jax.numpy.float32)

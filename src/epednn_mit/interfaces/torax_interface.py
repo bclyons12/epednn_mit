@@ -105,6 +105,12 @@ _SCOPING_INPUT_BOUNDS: Final[dict[str, tuple[float, float]]] = {
     "nsfrac": (0.2, 0.8),
     "tesep": (50.0, 500.0),
 }
+# ψ_N surface where the scoping shape parameters (kappa, delta) are sampled.
+# EPED itself takes the shape at the LCFS, but it does not model X-points, so
+# LCFS values that include them can throw off the prediction. ψ_N = 0.995 is
+# the recommended approximation when coupling to a core transport model, as in
+# MAESTRO (A. Ho, private communication, July 2026).
+_SCOPING_SHAPE_PSI_NORM: Final[float] = 0.995
 
 
 @jax.tree_util.register_dataclass
@@ -365,8 +371,15 @@ class EPEDNNmitPedestalModel(torax.pedestal.PedestalStructureModel):
       #     shaping = 0.5*(1 + kappa^2*(1 + 2*delta^2 - 1.2*delta^3))
       #               * (1.17 - 0.65*epsilon) / (1 - epsilon^2)^2
       #   nsfrac = n_e,sep / n_e_ped
-      kappa = geo.elongation_face[-1]
-      delta = geo.delta_face[-1]
+      # kappa and delta in qstar are the same values passed to the network.
+      kappa = jnp.interp(
+          _SCOPING_SHAPE_PSI_NORM,
+          core_profiles.psi_norm_face,
+          geo.elongation_face,
+      )
+      delta = jnp.interp(
+          _SCOPING_SHAPE_PSI_NORM, core_profiles.psi_norm_face, geo.delta_face
+      )
       epsilon = geo.a_minor / geo.R_major
       shaping = (
           0.5
@@ -397,6 +410,9 @@ class EPEDNNmitPedestalModel(torax.pedestal.PedestalStructureModel):
           dtype=jnp.float32,
       )
     else:
+      # BCL 11/23/26: the SPARC README says kappa and delta were taken at
+      # ψ_N = 0.995 in training, so sampling them at _SCOPING_SHAPE_PSI_NORM
+      # would match it better, but that shifts existing SPARC predictions.
       raw_inputs = jnp.array(
           [
               Ip * 1e-6,  # [MA]
